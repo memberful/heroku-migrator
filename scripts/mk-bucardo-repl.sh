@@ -34,10 +34,39 @@ then usage 1
 fi
 
 # Copy the schema from the primary to the (soon to be) replica.
+#
+# Three text transforms before piping to psql:
+#   1. Skip COMMENT ON EXTENSION (requires superuser; harmless).
+#   2. Skip CREATE/ALTER OPERATOR FAMILY|CLASS. On Heroku Postgres these are
+#      extension-owned but missing their pg_depend link to the extension, so
+#      pg_dump emits them standalone — and they require superuser on the
+#      target. The replica's CREATE EXTENSION recreates them with correct
+#      ownership. ALTER ... ADD spans multiple lines, so we track from the
+#      opener through the terminating semicolon.
+#   3. Rewrite heroku_ext.* -> public.* . Since 2023, Heroku Postgres installs
+#      every extension into a "heroku_ext" schema, and DDL like CREATE INDEX
+#      bakes that prefix into qualified references (e.g., heroku_ext.gin_trgm_ops).
+#      PlanetScale installs extensions into "public", so we rewrite the prefix.
+#
+# Each transformed line is echoed to stderr so the operator can see what
+# was changed.
 if [ "$SKIP_SCHEMA" -eq 0 ]; then
   echo "Copying schema from primary to replica..."
   pg_dump --no-owner --no-privileges --no-publications --no-subscriptions --schema-only "$PRIMARY" |
-  grep -v -E "^COMMENT ON EXTENSION " |
+  awk '
+    /^COMMENT ON EXTENSION / { print "[schema-filter] skip: " $0 > "/dev/stderr"; next }
+    /^(CREATE|ALTER) OPERATOR (FAMILY|CLASS) / {
+      print "[schema-filter] skip: " $0 > "/dev/stderr"
+      skip = 1
+    }
+    skip { if (/;[[:space:]]*$/) skip = 0; next }
+    {
+      if (gsub(/heroku_ext\./, "public.") > 0) {
+        print "[schema-filter] rewrote heroku_ext. -> public. on line " NR > "/dev/stderr"
+      }
+      print
+    }
+  ' |
   psql "$REPLICA" -a --set ON_ERROR_STOP=1
 else
   echo "Skipping schema copy (--skip-schema flag set)"
